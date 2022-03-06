@@ -4,11 +4,13 @@ import pandas as pd
 import json
 import googleapiclient
 from googleapiclient.discovery import build
+import logging
+logging.basicConfig(level=logging.INFO)
 
 
 def get_records(file_id, recurse):
     records = []
-    fields = "name id parents permissions appProperties".split(" ")
+    fields = "name id parents permissions mimeType appProperties".split(" ")
     def visit(fid, service, depth=0):
         file = service.files().get(fileId=fid,
                                    supportsAllDrives=True,
@@ -23,6 +25,8 @@ def get_records(file_id, recurse):
         if recurse and is_dir:
                 children = service.files().list(
                                                q=f"'{fid}' in parents",
+                                               includeItemsFromAllDrives=True,
+                                               supportsAllDrives=True,
                                               fields="nextPageToken, files(id)").execute()
                 for child in children["files"]:
                     visit(child.get("id"), service, depth + 1)
@@ -63,37 +67,11 @@ def is_shared_drive(file_id, service=None):
         return visit(file_id, service)
 
 
-def create_folder(name, parent_id=None, extra=None, service=None):
-    def inner():
-        file_metadata = {
-                'name': name,
-                'mimeType': 'application/vnd.google-apps.folder'
-                }
-        if meta:
-            file_metadata["appProperties"] = extra
-        if parent_id:
-            if not isinstance(parent_id, list):
-                parent_id = [parent_id]
-            file_metadata['parents'] = parent_id
-
-        file = service.files().create(body=file_metadata,
-                                      supportsAllDrives=True,
-                                      fields='id,webViewLink').execute()
-        return file
-
-    if service:
-        return inner()
-
+def recursive_move(source_id, dest_id, dry_run=True):
+    logging.info(f"Move from: {source_id} to {dest_id}")
     cred = get_credentials()
     with build('drive', 'v3', credentials=cred) as service:
-        return inner()
-
-
-def recursive_move(source_id, dest_id):
-    cred = get_credentials()
-    with build('drive', 'v3', credentials=cred) as service:
-        changed_dirs = _recursive_move(file_id=source_id, dest_folder_id=dest_id, service=service)
-        print(json.dumps(changed_dirs))
+        changed_dirs = _recursive_move(file_id=source_id, dest_folder_id=dest_id, service=service, dry_run=dry_run)
         return changed_dirs
 
 
@@ -112,57 +90,137 @@ def check_unknown_parents(file_list):
     missing_parents = np.setdiff1d(parents, df.id)
     if len(missing_parents):
         affected_files = unstacked.loc[unstacked.parents.isin(missing_parents)]
-        print("Some items have more than one parent directory, of which at least one is unknown. Such items will lose the connection to that parent. Affected files are:")
-        print(affected_files[["name", "id", "parents"]].to_string())
+        logging.error("Some items have more than one parent directory, of which at least one is unknown. Such items will lose the connection to that parent. Affected files are:")
+        logging.error(affected_files[["name", "id", "parents"]].to_string())
 
 
 def _make_extras(file):
-    return {"gdrive_transfer-originalId": file.id,
-            "gdrive_transfer-originalParents": file.parents,
-            "gdrive_transfer-originalPermissions": file.permissions}
+    extra = {"GDT-origId": file.id}
+
+    for i, parent in enumerate(file.parents):
+        extra[f"GDT-origParents-{i}"] = parent
+    for i, permission in enumerate(file.permissions):
+        who = permission.get("emailAddress", "anyone")
+        role = permission.get("role")[:2]
+        extra[f"GDT-origPerms-{i}"] = f"{who}={role}"
+    for k, v in extra.items():
+        s = len(k.encode('utf-8')) + len(v.encode('utf-8'))
+        logging.debug(f"{k}: {v} = {s}")
+    return extra
 
 
-def _recursive_move(file_id, dest_folder_id, service):
+def _recursive_move(file_id, dest_folder_id, service, dry_run=True):
     # Get file list
-    file_list = pd.from_json(get_records(file_id, recurse=True))
+    file_list = pd.read_json(json.dumps(get_records(file_id, recurse=True)))
     check_unknown_parents(file_list)
 
     tgt_is_shared_drive = is_shared_drive(dest_folder_id, service)
     if len(file_list) == 1 and not (file_list[0].is_dir and tgt_is_shared_drive):
         # Single file specified
-        extra = make_extras(file_list[0])
+        extra = _make_extras(file_list[0])
         return move_one(file_id, dest_folder_id, service, extra=extra)
 
     # clone directory tree
     directories = file_list.loc[file_list.is_dir].sort_values("depth")
-    directory_mapping = {directories[0].parents: dest_folder_id}
+    directory_mapping = {directories.loc[0].parents[0]: dest_folder_id}
     for directory in directories.itertuples():
-        extra = make_extras(directory)
+        extra = _make_extras(directory)
         new_parent_ids = [directory_mapping[p] for p in directory.parents]
-        new_dir = create_folder(directory.name, parent_id=new_parent_ids, extra=extra, service=service)
-        directory_mapping[directory.id] = new_dir.id
+        new_dir = create(directory.name, filetype="folder", parent_id=new_parent_ids, extra=extra, service=service)
+        directory_mapping[directory.id] = new_dir["id"]
 
     # Move files over
     files = file_list.loc[~file_list.is_dir]
     for file in files.itertuples():
-        extra = make_extras(file)
-        new_parent_ids = [directory_mapping[p] for p in file.parents]
-        move_one(file.id, ",".join(new_parent_ids), service, extra=extra)
+        extra = _make_extras(file)
+        new_parent_ids = [directory_mapping[p] for p in file.parents if p in directory_mapping]
+        move_one(file.id, new_parent_ids[0], service, extra=extra, dry_run=dry_run)
+        for parent in new_parent_ids[1:]:
+            create_shortcut(file, parent, extra, service)
     return directory_mapping
 
 
-def move_one(source_id, dest_folder_id, drive_service, extra=None):
+def move_one(source_id, dest_folder_id, drive_service, extra=None, dry_run=True):
+    logging.info(f"Moving a single file, {source_id}, to {dest_folder_id}")
     file = drive_service.files().get(fileId=source_id,
                                      fields='parents').execute()
     previous_parents = ",".join(file.get('parents'))
 
-    file = drive_service.files().update(fileId=source_id,
-                                        appProperties=extra
-                                        addParents=dest_folder_id,
-                                        removeParents=previous_parents,
-                                        supportsAllDrives=True,
-                                        fields='id, parents, webViewLink').execute()
+    update = dict(fileId=source_id,
+                  body=dict(appProperties=extra),
+                  addParents=dest_folder_id,
+                  removeParents=previous_parents,
+                  supportsAllDrives=True,
+                  fields='id, parents, webViewLink'
+                  )
+    if dry_run:
+        print(update)
+    else:
+        file = drive_service.files().update(**update).execute()
     return file
+
+
+def create(name, filetype, parent_id=None, extra=None, service=None):
+    logging.info(f"Creating '{name}' of type {filetype}")
+    mimetypes = dict(doc="application/vnd.google-apps.document",
+                     spreadsheet="application/vnd.google-apps.spreadsheet",
+                     folder='application/vnd.google-apps.folder',
+                     )
+    assert filetype in mimetypes
+    def inner(parent_id):
+        file_metadata = {
+                'name': name,
+                'mimeType': mimetypes[filetype]
+                }
+        if extra:
+            file_metadata["appProperties"] = extra
+        if parent_id:
+            if not isinstance(parent_id, list):
+                parent_id = [parent_id]
+            file_metadata['parents'] = parent_id
+
+        logging.debug(f"{file_metadata=}")
+        file = service.files().create(body=file_metadata,
+                                      supportsAllDrives=True,
+                                      fields='id,webViewLink').execute()
+        return file
+
+    if service:
+        return inner(parent_id)
+
+    cred = get_credentials()
+    with build('drive', 'v3', credentials=cred) as service:
+        return inner(parent_id)
+
+
+def create_shortcut(target_file, parent_id=None, extra=None, service=None):
+    logging.info(f"Creating shortcut to '{target_file.get('id')}' in {parent_id}")
+    def inner(parent_id):
+        file_metadata = {
+                'name': target_file.get('name'),
+                'mimeType': 'application/vnd.google-apps.shortcut',
+                'shortcutDetails': {
+                    'targetId': target_file.get('id')
+                    }
+                }
+        if extra:
+            file_metadata["appProperties"] = extra
+        if parent_id:
+            if not isinstance(parent_id, list):
+                parent_id = [parent_id]
+            file_metadata['parents'] = parent_id
+
+        file = service.files().create(body=file_metadata,
+                                      supportsAllDrives=True,
+                                      fields='id,webViewLink').execute()
+        return file
+
+    if service:
+        return inner(parent_id)
+
+    cred = get_credentials()
+    with build('drive', 'v3', credentials=cred) as service:
+        return inner(parent_id)
 
 ## Tests
 # RecurseMove with: 
@@ -171,3 +229,4 @@ def move_one(source_id, dest_folder_id, drive_service, extra=None):
 # - [ ] single file with multiple parents that are contained in the directory structure
 # - [ ] single file having multiple parents of which one or more are not in the directory structure
 # - [ ] single file having multiple parents of which one or more are not in the directory structure
+# - [ ] do we preserve existing appProperties?
