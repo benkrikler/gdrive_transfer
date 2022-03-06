@@ -7,6 +7,8 @@ authors = ["Ben Krikler <4083697+benkrikler@users.noreply.github.com>"]
 [tool.poetry.dependencies]
 python = "^3.8"
 google-api-python-client = "^2.39.0"
+google-auth-oauthlib = "^0.5.0"
+pandas = "^1.4.1"
 
 [tool.poetry.dev-dependencies]
 pytest = "^5.2"
