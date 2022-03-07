@@ -130,3 +130,5 @@ dmypy.json
 
 # Text editors
 .*sw[op]
+
+secrets
