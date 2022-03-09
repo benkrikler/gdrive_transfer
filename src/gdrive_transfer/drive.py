@@ -85,7 +85,7 @@ def recursive_move(source_id, dest_id, dry_run=True, known_parents=None):
 def check_unknown_parents(df, missing_parents=None):
     if missing_parents:
         missing_parents = {n: p if isinstance(p, list) else [p] for n, p in missing_parents.items()}
-        df.parents = df.set_index("id").parents.fillna(missing_parents)
+        df.parents = df.set_index("id").parents.fillna(missing_parents).values
     num_parents = df.parents.str.len()
     multiple_parents = num_parents.loc[num_parents > 1]
     if multiple_parents.empty:
@@ -100,8 +100,8 @@ def check_unknown_parents(df, missing_parents=None):
     missing_parents = np.setdiff1d(parents, df.id)
     if len(missing_parents):
         affected_files = unstacked.loc[unstacked.parents.isin(missing_parents)]
-        logging.error("Some items have more than one parent directory, of which at least one is unknown. Such items will lose the connection to that parent. Affected files are:")
-        logging.error(affected_files[["name", "id", "parents"]].to_string())
+        logging.warning("Some items have more than one parent directory, of which at least one is unknown. Such items will lose the connection to that parent. Affected files are:")
+        logging.warning(affected_files[["name", "id", "parents"]].to_string())
     return df
 
 
