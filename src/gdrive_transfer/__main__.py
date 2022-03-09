@@ -8,7 +8,13 @@ def prep_parser():
     parser.add_argument("-s", "--source", dest="source_id", required=True)
     parser.add_argument("-d", "--dest", dest="dest_id")
     parser.add_argument("-a", "--action", choices=("ls_json", "ls", "mv", "mkdir", "mk_test", "own"), default="ls")
-    parser.add_argument("-r", "--actually-run", default=False, action="store_true")
+    parser.add_argument("-r", "--actually-run", default=False, action="store_true", help="If action == mv")
+    def tuple2(arg):
+        value = arg.split(":")
+        if len(value) != 2:
+            raise argparse.ArgumentTypeError('invalid format for parent - needs to contain a single colon-separated key-value pair')
+        return tuple(value)
+    parser.add_argument("-p", "--parents", default=[], action="append", type=tuple2, help="If action == mv")
     return parser
 
 
@@ -21,7 +27,7 @@ if __name__ == "__main__":
     elif args.action == "mv":
         if not "dest_id" in args:
             raise ValueError("Need to provide destination with `-d` or `--dest` for mv action")
-        print(drive.recursive_move(args.source_id, args.dest_id, dry_run=not args.actually_run))
+        print(drive.recursive_move(args.source_id, args.dest_id, dry_run=not args.actually_run, known_parents=dict(args.parents)))
     elif args.action == "mkdir":
         print(drive.create_folder(args.source_id, args.dest_id, "random_string"))
     elif args.action == "mk_test":

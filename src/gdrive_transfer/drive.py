@@ -73,19 +73,23 @@ def is_shared_drive(file_id, service=None):
     return __run(visit, service, file_id)
 
 
-def recursive_move(source_id, dest_id, dry_run=True):
+def recursive_move(source_id, dest_id, dry_run=True, known_parents=None):
     logging.info(f"Move from: {source_id} to {dest_id}")
     cred = get_credentials()
     with build('drive', 'v3', credentials=cred) as service:
-        result = _recursive_move(file_id=source_id, dest_folder_id=dest_id, service=service, dry_run=dry_run)
+        result = _recursive_move(file_id=source_id, dest_folder_id=dest_id, service=service,
+                                 dry_run=dry_run, known_parents=known_parents)
         return result
 
 
-def check_unknown_parents(df):
+def check_unknown_parents(df, missing_parents=None):
+    if missing_parents:
+        missing_parents = {n: p if isinstance(p, list) else [p] for n, p in missing_parents.items()}
+        df.parents = df.set_index("id").parents.fillna(missing_parents)
     num_parents = df.parents.str.len()
     multiple_parents = num_parents.loc[num_parents > 1]
     if multiple_parents.empty:
-        return
+        return df
 
     unstacked = pd.DataFrame({
         col:np.repeat(df[col].values, df["parents"].str.len())
@@ -98,6 +102,7 @@ def check_unknown_parents(df):
         affected_files = unstacked.loc[unstacked.parents.isin(missing_parents)]
         logging.error("Some items have more than one parent directory, of which at least one is unknown. Such items will lose the connection to that parent. Affected files are:")
         logging.error(affected_files[["name", "id", "parents"]].to_string())
+    return df
 
 
 def _make_extras(file):
@@ -115,10 +120,10 @@ def _make_extras(file):
     return extra
 
 
-def _recursive_move(file_id, dest_folder_id, service, dry_run=True):
+def _recursive_move(file_id, dest_folder_id, service, dry_run=True, known_parents=None):
     # Get file list
     file_list = pd.read_json(json.dumps(get_records(file_id, recurse=True, service=service)))
-    check_unknown_parents(file_list)
+    file_list = check_unknown_parents(file_list, missing_parents=known_parents)
 
     tgt_is_shared_drive = is_shared_drive(dest_folder_id, service)
     if len(file_list) == 1 and not (file_list[0].is_dir and tgt_is_shared_drive):
